@@ -802,6 +802,37 @@ struct FlameGraphNode {
     pub children: Vec<FlameGraphNode>,
 }
 
+fn same_executable_path(lhs: FileId, rhs: FileId) -> bool {
+    let Some(lhs_meta) = DB.executables.get(lhs) else {
+        return false;
+    };
+    let Some(rhs_meta) = DB.executables.get(rhs) else {
+        return false;
+    };
+
+    let lhs_path = lhs_meta.get().executable_path.as_ref().map(|x| x.as_str());
+    let rhs_path = rhs_meta.get().executable_path.as_ref().map(|x| x.as_str());
+
+    matches!((lhs_path, rhs_path), (Some(lhs), Some(rhs)) if lhs == rhs)
+}
+
+fn node_matches_symbolized_frame(
+    existing: &FlameGraphNode,
+    incoming: &SymbolizedFrame,
+    incoming_text: &str,
+) -> bool {
+    if !matches!(incoming.raw.kind.interp(), Some(InterpKind::Native)) {
+        return existing.id == incoming.raw.id;
+    }
+
+    if existing.text != incoming_text {
+        return false;
+    }
+
+    same_executable_path(existing.id.file_id, incoming.raw.id.file_id)
+        || existing.id == incoming.raw.id
+}
+
 impl Default for FlameGraphNode {
     fn default() -> Self {
         Self::root()
@@ -814,13 +845,14 @@ impl FlameGraphNode {
     }
 
     pub fn new_meta_node(text: String, addr_or_line: u64) -> Self {
+        let id = FrameId {
+            file_id: FileId::from(0),
+            addr_or_line,
+        };
         FlameGraphNode {
             text,
             weight: 0,
-            id: FrameId {
-                file_id: FileId::from(0),
-                addr_or_line: addr_or_line,
-            },
+            id,
             fg_color: Color32::WHITE,
             inline_skip: 0,
             bg_color: Color32::from_rgb(0x39, 0x3D, 0x3F),
@@ -845,25 +877,6 @@ impl FlameGraphNode {
 
         for frame in trace.iter().rev() {
             let frame: Frame = (*frame).into();
-
-            // WARN: this `find` makes flame graph construction O(n^2) in the
-            //       worst case, but I found that in the average case this is
-            //       actually quite a bit faster than a hashmap/btreemap based
-            //       approach. Most nodes only have one or two nodes.
-            // TODO: experiment with a mixed approach that uses linear search for
-            //       nodes with <8 nodes and a hashmap for larger ones
-            if let Some(mut child) = node.children.iter_mut().find(|x| x.id == frame.id.into()) {
-                child.weight += weight;
-
-                for _ in 0..child.inline_skip {
-                    child = child.children.first_mut().unwrap();
-                    child.weight += weight;
-                }
-
-                node = unsafe { &mut *(child as *mut _) };
-                continue;
-            }
-
             if let FrameKind::Abort = frame.kind {
                 node.children.push(FlameGraphNode {
                     weight,
@@ -887,25 +900,53 @@ impl FlameGraphNode {
 
             let inline_frames = symbolize_frame(frame, inline_frames);
             assert!(!inline_frames.is_empty());
+            let first_text = match frame.kind.interp() {
+                None => inline_frames[0].to_string(),
+                Some(interp) => format!("{} [{}]", inline_frames[0], interp),
+            };
+
+            // WARN: this `find` makes flame graph construction O(n^2) in the
+            //       worst case, but I found that in the average case this is
+            //       actually quite a bit faster than a hashmap/btreemap based
+            //       approach. Most nodes only have one or two nodes.
+            // TODO: experiment with a mixed approach that uses linear search for
+            //       nodes with <8 nodes and a hashmap for larger ones
+            if let Some(mut child) = node
+                .children
+                .iter_mut()
+                .find(|x| node_matches_symbolized_frame(x, &inline_frames[0], &first_text))
+            {
+                child.weight += weight;
+
+                for _ in 0..child.inline_skip {
+                    child = child.children.first_mut().unwrap();
+                    child.weight += weight;
+                }
+
+                node = unsafe { &mut *(child as *mut _) };
+                continue;
+            }
+
             let mut inline_len = Some((inline_frames.len() - 1) as u16);
 
             for (i, inline_node) in inline_frames.into_iter().enumerate() {
                 assert!(i == 0 || node.children.is_empty());
+                let text = match frame.kind.interp() {
+                    None => inline_node.to_string(),
+                    Some(interp) => format!(
+                        "{} [{}]{}",
+                        inline_node,
+                        interp,
+                        if i > 0 { " [Inline]" } else { "" },
+                    ),
+                };
 
                 node.children.push(FlameGraphNode {
                     weight,
                     fg_color: Color32::BLACK,
                     bg_color: frame_kind_color(frame.kind),
                     id: inline_node.raw.id,
-                    text: match frame.kind.interp() {
-                        None => inline_node.to_string(),
-                        Some(interp) => format!(
-                            "{} [{}]{}",
-                            inline_node,
-                            interp,
-                            if i > 0 { " [Inline]" } else { "" },
-                        ),
-                    },
+                    text,
                     inline_skip: inline_len.take().unwrap_or(0),
                     children: vec![],
                 });
