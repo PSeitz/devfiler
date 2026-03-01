@@ -117,7 +117,7 @@ async fn ingest_task_controller(
                 exe.symb_status = match result {
                     Ok(status) => status,
                     Err(e) => {
-                        tracing::error!("Failed to pull symbols: {e:?}");
+                        tracing::error!("Failed to ingest symbols: {e:?}");
                         SymbStatus::TempError { last_attempt: now }
                     }
                 };
@@ -132,13 +132,110 @@ async fn ingest_task_controller(
         // In both cases: spawn as many new tasks as the limit permits.
         while !pending.is_empty() && tasks.len() < SYMB_MAX_PAR {
             let (file_id, meta) = pending.pop().unwrap();
-            if !symb_endpoint.is_empty() {
-                let task = fetch_and_insert_symbols(symb_endpoint.clone(), file_id, meta);
-                tasks.spawn(async move { (file_id, task.await) });
-                active.insert(file_id);
-            }
+            let task = fetch_local_or_remote_symbols(symb_endpoint.clone(), file_id, meta);
+            tasks.spawn(async move { (file_id, task.await) });
+            active.insert(file_id);
         }
     }
+}
+
+async fn fetch_local_or_remote_symbols(
+    symb_endpoint: String,
+    file_id: FileId,
+    meta: ExecutableMeta,
+) -> Result<SymbStatus> {
+    if let Some(path) = resolve_local_executable_path(file_id, &meta)? {
+        tracing::info!(
+            "Ingesting local symbols for file ID {} from {}",
+            file_id.format_hex(),
+            path.display()
+        );
+        return ingest_local_symbols(file_id, path).await;
+    }
+
+    if symb_endpoint.is_empty() {
+        tracing::debug!(
+            "No local executable path for file ID {} and --symb-endpoint is not configured",
+            file_id.format_hex()
+        );
+        // Terminal state: there is no configured source to fetch symbols from.
+        return Ok(SymbStatus::NotPresentGlobally);
+    }
+
+    tracing::info!(
+        "Falling back to remote symbol endpoint for file ID {}",
+        file_id.format_hex()
+    );
+    fetch_and_insert_symbols(symb_endpoint, file_id, meta).await
+}
+
+fn normalize_executable_path(path: &str) -> Option<PathBuf> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let path = path.trim_end_matches(" (deleted)");
+    if path.is_empty() {
+        return None;
+    }
+
+    let mut path = PathBuf::from(path);
+    if path.is_relative() {
+        let cwd = std::env::current_dir().ok()?;
+        path = cwd.join(path);
+    }
+    Some(path)
+}
+
+fn resolve_local_executable_path(
+    file_id: FileId,
+    meta: &ExecutableMeta,
+) -> Result<Option<PathBuf>> {
+    let Some(raw_path) = meta.executable_path.as_deref() else {
+        tracing::debug!(
+            "No process.executable.path recorded for file ID {}",
+            file_id.format_hex()
+        );
+        return Ok(None);
+    };
+    let Some(path) = normalize_executable_path(raw_path) else {
+        tracing::warn!(
+            "Invalid process.executable.path=\"{}\" for file ID {}",
+            raw_path,
+            file_id.format_hex()
+        );
+        return Ok(None);
+    };
+
+    if !path.exists() {
+        tracing::info!(
+            "Executable path {} does not exist for file ID {}",
+            path.display(),
+            file_id.format_hex()
+        );
+        return Ok(None);
+    }
+
+    let local_file_id = FileId::from_path(&path)
+        .with_context(|| format!("failed to calculate file ID for {}", path.display()))?;
+    if local_file_id != file_id {
+        tracing::warn!(
+            "Executable path {} has file ID {}, expected {}",
+            path.display(),
+            local_file_id.format_hex(),
+            file_id.format_hex()
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(path))
+}
+
+async fn ingest_local_symbols(file_id: FileId, path: PathBuf) -> Result<SymbStatus> {
+    let num_symbols =
+        tokio::task::spawn_blocking(move || extract_and_insert_symbols(file_id, path, None, None))
+            .await??;
+    Ok(SymbStatus::Complete { num_symbols })
 }
 
 /// Pull symbols for the given executable from Elastic's global symbolization
@@ -149,8 +246,9 @@ async fn fetch_and_insert_symbols(
     meta: ExecutableMeta,
 ) -> Result<SymbStatus> {
     let exe = meta
-        .file_name
+        .executable_path
         .clone()
+        .or(meta.file_name.clone())
         .unwrap_or_else(|| format!("{file_id:?}"));
 
     tracing::info!(
@@ -315,6 +413,67 @@ fn build_sym_url(symb_endpoint: &str, file_id: FileId, file: &str) -> String {
     [symb_endpoint, &s[0..2], &s[2..4], &s, file].join("/")
 }
 
+fn extract_and_insert_symbols(
+    file_id: FileId,
+    path: PathBuf,
+    ranges_ingested: Option<Arc<AtomicUsize>>,
+    ranges_extracted: Option<Arc<AtomicUsize>>,
+) -> Result<u64> {
+    // Open executable's DWARF info.
+    let obj = symblib::objfile::File::load(&path)?;
+    let obj = obj.parse()?;
+    let dw = symblib::dwarf::Sections::load(&obj)?;
+
+    // Spawn another task for the conversion to DB format + insert.
+    let (tx, rx) = mpsc::sync_channel(10 * 1024);
+    let insert_task = tokio::task::spawn_blocking(move || -> Result<()> {
+        insert_symbols(
+            file_id,
+            rx.into_iter()
+                .inspect(|_| {
+                    if let Some(counter) = &ranges_ingested {
+                        counter.fetch_add(1, Relaxed);
+                    }
+                })
+                .into_fallible()
+                .map_err(|_| unreachable!()),
+        )?;
+        Ok(())
+    });
+
+    // Feed the ingest thread with ranges.
+    let mut multi =
+        symbconv::multi::Extractor::new(&obj).context("failed to create multi extractor")?;
+
+    multi.add("dwarf", symbconv::dwarf::Extractor::new(&dw));
+    multi.add("go", symbconv::go::Extractor::new(&obj));
+    multi.add(
+        "dbg-obj-sym",
+        symbconv::obj::Extractor::new(&obj, objfile::SymbolSource::Debug),
+    );
+    multi.add(
+        "dyn-obj-sym",
+        symbconv::obj::Extractor::new(&obj, objfile::SymbolSource::Dynamic),
+    );
+
+    let mut num_symbols = 0_u64;
+    multi.extract(&mut |range| {
+        let _ = tx.send(symbfile::Record::Range(range));
+        num_symbols += 1;
+        if let Some(counter) = &ranges_extracted {
+            counter.fetch_add(1, Relaxed);
+        }
+        Ok(())
+    })?;
+
+    // Close channel and wait for insertion task to finish.
+    drop(tx);
+    let rt = tokio::runtime::Handle::current();
+    rt.block_on(insert_task).expect("DB inserter panicked")?;
+
+    Ok(num_symbols)
+}
+
 /// Extract and ingest executable symbols in a background thread.
 pub struct IngestTask {
     task: JoinHandle<Result<()>>,
@@ -365,78 +524,56 @@ impl IngestTask {
             file_id.format_es(),
             path.display()
         );
-
-        // Open executable's DWARF info.
-        let obj = symblib::objfile::File::load(&path)?;
-        let obj = obj.parse()?;
-        let dw = symblib::dwarf::Sections::load(&obj)?;
-
-        // Spawn another task for the conversion to DB format + insert.
-        let (tx, rx) = mpsc::sync_channel(10 * 1024);
-        let insert_task = tokio::task::spawn_blocking(move || -> Result<()> {
-            insert_symbols(
-                file_id,
-                rx.into_iter()
-                    .inspect(|_| {
-                        ranges_ingested.fetch_add(1, Relaxed);
-                    })
-                    .into_fallible()
-                    .map_err(|_| unreachable!()),
-            )?;
-            Ok(())
-        });
-
-        // Feed the ingest thread with ranges.
-        let mut multi =
-            symbconv::multi::Extractor::new(&obj).context("failed to create multi extractor")?;
-
-        multi.add("dwarf", symbconv::dwarf::Extractor::new(&dw));
-        multi.add("go", symbconv::go::Extractor::new(&obj));
-        multi.add(
-            "dbg-obj-sym",
-            symbconv::obj::Extractor::new(&obj, objfile::SymbolSource::Debug),
-        );
-        multi.add(
-            "dyn-obj-sym",
-            symbconv::obj::Extractor::new(&obj, objfile::SymbolSource::Dynamic),
-        );
-
-        multi.extract(&mut |range| {
-            let _ = tx.send(symbfile::Record::Range(range));
-            ranges_extracted.fetch_add(1, Relaxed);
-            Ok(())
-        })?;
-
-        // Close channel and wait for insertion task to finish.
-        drop(tx);
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(insert_task).expect("DB inserter panicked")?;
+        let num_symbols = extract_and_insert_symbols(
+            file_id,
+            path.clone(),
+            Some(ranges_ingested),
+            Some(ranges_extracted),
+        )?;
 
         // Update or create executable record.
-        let num_symbols = ranges_extracted.load(Relaxed) as u64;
         let symb_status = SymbStatus::Complete { num_symbols };
-
-        DB.executables.insert(
-            file_id,
-            DB.executables.get(file_id).map_or_else(
-                || ExecutableMeta {
-                    build_id: None,
-                    file_name: Some(
-                        path.file_name()
-                            .expect("could not have opened otherwise")
-                            .to_string_lossy()
-                            .into_owned(),
-                    ),
-                    symb_status,
-                },
-                |exe| {
-                    let mut exe = exe.read();
-                    exe.symb_status = symb_status;
-                    exe
-                },
-            ),
-        );
+        let mut exe = DB
+            .executables
+            .get(file_id)
+            .map(|x| x.read())
+            .unwrap_or_else(|| ExecutableMeta {
+                build_id: None,
+                file_name: path.file_name().map(|x| x.to_string_lossy().into_owned()),
+                executable_path: None,
+                symb_status,
+            });
+        exe.symb_status = symb_status;
+        exe.executable_path = Some(path.to_string_lossy().into_owned());
+        if exe.file_name.is_none() {
+            exe.file_name = path.file_name().map(|x| x.to_string_lossy().into_owned());
+        }
+        DB.executables.insert(file_id, exe);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_executable_path_rejects_empty() {
+        assert!(normalize_executable_path("").is_none());
+        assert!(normalize_executable_path("   ").is_none());
+    }
+
+    #[test]
+    fn normalize_executable_path_trims_deleted_suffix() {
+        let path = normalize_executable_path("/tmp/mybin (deleted)").unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/mybin"));
+    }
+
+    #[test]
+    fn normalize_executable_path_resolves_relative_paths() {
+        let path = normalize_executable_path("target/debug/app").unwrap();
+        assert!(path.is_absolute());
+        assert!(path.ends_with("target/debug/app"));
     }
 }

@@ -29,6 +29,11 @@ it to `127.0.0.1:11000`, the connection will be forwarded to your local devfiler
 
 ### Adding symbols for native executables
 
-Symbols for native executables can be added by navigating to the "Executables" tab in devfiler,
-then simply dragging and dropping the executable anywhere within the window. A progress indicator
-shows up during ingestion.
+devfiler automatically tries to ingest native symbols from
+`process.executable.path` in incoming OTLP samples (when the executable is
+accessible on the local filesystem).
+
+If auto-ingestion cannot resolve the executable path, symbols can still be added
+manually by navigating to the "Executables" tab in devfiler and dragging and
+dropping the executable anywhere within the window. A progress indicator shows
+up during ingestion.

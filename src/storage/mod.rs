@@ -26,7 +26,7 @@ use tracing::warn;
 /// Bump this on any breaking schema change. Both the serialization scheme for
 /// our keys and our values doesn't support schema evolution, so essentially any
 /// change other than adding or deleting tables is a breaking one.
-const DB_VERSION: u32 = 5;
+const DB_VERSION: u32 = 6;
 
 lazy_static::lazy_static! {
     /// Global database instance.

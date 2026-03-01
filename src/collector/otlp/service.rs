@@ -26,8 +26,10 @@ use crate::collector::otlp::pb::profiles::v1development::{
 use crate::collector::Stats;
 use crate::storage::*;
 use chrono::Utc;
+use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 use xxhash_rust::xxh3;
 
@@ -41,6 +43,11 @@ impl ProfilesService {
     pub fn new(stats: Arc<Stats>) -> Self {
         ProfilesService { stats }
     }
+}
+
+lazy_static::lazy_static! {
+    /// Caches executable path to file ID lookups to avoid repeated file hashing.
+    static ref EXE_PATH_ID_CACHE: Mutex<HashMap<String, FileId>> = Mutex::new(HashMap::new());
 }
 
 #[tonic::async_trait]
@@ -83,7 +90,7 @@ impl pb_collector::profiles_service_server::ProfilesService for ProfilesService 
     }
 }
 
-fn get_str<'tab>(table: &'tab Vec<String>, index: usize, field: &str) -> Result<&'tab str, Status> {
+fn get_str<'tab>(table: &'tab [String], index: usize, field: &str) -> Result<&'tab str, Status> {
     if index == 0 {
         return Err(Status::invalid_argument(format!(
             "{field} field is not optional"
@@ -100,7 +107,7 @@ fn get_str<'tab>(table: &'tab Vec<String>, index: usize, field: &str) -> Result<
 }
 
 fn get_str_opt<'tab>(
-    table: &'tab Vec<String>,
+    table: &'tab [String],
     index: usize,
     field: &str,
 ) -> Result<Option<&'tab str>, Status> {
@@ -113,18 +120,14 @@ fn get_str_opt<'tab>(
 
 // get_attr looks up indices in table and returns the value where the first key at one of
 // these indices is field.
-fn get_attr<'tab>(
-    str_table: &Vec<String>,
-    kvu_table: &'tab Vec<KeyValueAndUnit>,
-    indices: Vec<i32>,
+fn get_attr_opt<'tab>(
+    str_table: &[String],
+    kvu_table: &'tab [KeyValueAndUnit],
+    indices: &[i32],
     field: &str,
-) -> Result<&'tab str, Status> {
-    if indices.is_empty() {
-        return Err(Status::invalid_argument("empty list of attribute indices"));
-    }
-
+) -> Result<Option<&'tab str>, Status> {
     for idx in indices {
-        let Some(kv) = kvu_table.get(idx as usize) else {
+        let Some(kv) = kvu_table.get(*idx as usize) else {
             return Err(Status::invalid_argument(format!(
                 "index {idx} out of bounds"
             )));
@@ -140,7 +143,7 @@ fn get_attr<'tab>(
         return if let Some(Value::StringValue(ref str)) =
             kv.value.as_ref().and_then(|x| x.value.as_ref())
         {
-            Ok(str.as_str())
+            Ok(Some(str.as_str()))
         } else {
             Err(Status::invalid_argument(format!(
                 "failed to cast {:?} as string for {field}",
@@ -149,9 +152,77 @@ fn get_attr<'tab>(
         };
     }
 
-    return Err(Status::invalid_argument(format!(
-        "failed to get {field} from attributes_tables for mapping"
-    )));
+    Ok(None)
+}
+
+fn get_attr<'tab>(
+    str_table: &[String],
+    kvu_table: &'tab [KeyValueAndUnit],
+    indices: &[i32],
+    field: &str,
+) -> Result<&'tab str, Status> {
+    get_attr_opt(str_table, kvu_table, indices, field)?.ok_or_else(|| {
+        Status::invalid_argument(format!("failed to get {field} from attributes table"))
+    })
+}
+
+fn normalize_executable_path(path: &str) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let path = path.trim_end_matches(" (deleted)");
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_owned())
+}
+
+fn file_id_from_path_cached(path: &str) -> Option<FileId> {
+    if let Some(file_id) = EXE_PATH_ID_CACHE.lock().unwrap().get(path).copied() {
+        return Some(file_id);
+    }
+
+    let file_id = FileId::from_path(Path::new(path)).ok();
+    if let Some(file_id) = file_id {
+        EXE_PATH_ID_CACHE
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), file_id);
+        return Some(file_id);
+    }
+    file_id
+}
+
+fn update_executable_path_hint(executable_path: &str) {
+    let Some(executable_path) = normalize_executable_path(executable_path) else {
+        return;
+    };
+    let Some(file_id) = file_id_from_path_cached(&executable_path) else {
+        tracing::debug!(
+            "Unable to calculate file ID from process.executable.path=\"{}\"",
+            executable_path
+        );
+        return;
+    };
+
+    let Some(exe_ref) = DB.executables.get(file_id) else {
+        return;
+    };
+
+    let mut exe = exe_ref.read();
+    if exe.executable_path.as_deref() == Some(executable_path.as_str()) {
+        return;
+    }
+
+    tracing::debug!(
+        "Mapped file ID {} to process.executable.path=\"{}\"",
+        file_id.format_hex(),
+        executable_path
+    );
+
+    exe.executable_path = Some(executable_path);
+    DB.executables.insert(file_id, exe);
 }
 
 fn ingest_locations(dic: &ProfilesDictionary) -> Result<Vec<Frame>, Status> {
@@ -163,12 +234,7 @@ fn ingest_locations(dic: &ProfilesDictionary) -> Result<Vec<Frame>, Status> {
     let mut mappings = Vec::with_capacity(locs.len());
 
     for loc in locs {
-        let kind = match get_attr(
-            stab,
-            atab,
-            loc.attribute_indices.to_vec(),
-            "profile.frame.type",
-        ) {
+        let kind = match get_attr(stab, atab, &loc.attribute_indices, "profile.frame.type") {
             Ok(kind) => kind,
             Err(_e) if locs.first() == Some(loc) => {
                 // By convention the first element in dic.location_table is an empty element.
@@ -221,14 +287,14 @@ fn ingest_locations(dic: &ProfilesDictionary) -> Result<Vec<Frame>, Status> {
             build_id = get_attr(
                 stab,
                 atab,
-                mapping.attribute_indices.to_vec(),
+                &mapping.attribute_indices,
                 "process.executable.build_id.htlhash", // OTel Profiling specific build ID.
             )
             .or_else(|_| {
                 get_attr(
                     stab,
                     atab,
-                    mapping.attribute_indices.to_vec(),
+                    &mapping.attribute_indices,
                     "process.executable.build_id.profiling", // Legacy OTel Profiling specific build ID.
                 )
             })?;
@@ -288,6 +354,7 @@ fn ingest_locations(dic: &ProfilesDictionary) -> Result<Vec<Frame>, Status> {
                             "file name",
                         )?
                         .map(ToOwned::to_owned),
+                        executable_path: None,
                         symb_status: SymbStatus::NotAttempted,
                     },
                 );
@@ -334,6 +401,22 @@ fn process_sample(
     sample: &Sample,
     frame_list: Vec<Frame>,
 ) -> Result<(), Status> {
+    let comm = get_attr_opt(
+        &dict.string_table,
+        &dict.attribute_table,
+        &sample.attribute_indices,
+        "thread.name",
+    )?;
+    let executable_path = get_attr_opt(
+        &dict.string_table,
+        &dict.attribute_table,
+        &sample.attribute_indices,
+        "process.executable.path",
+    )?;
+    if let Some(executable_path) = executable_path {
+        update_executable_path_hint(executable_path);
+    }
+
     // Insert frame list.
     let mut hasher = xxh3::Xxh3::new();
     frame_list.hash(&mut hasher);
@@ -348,13 +431,6 @@ fn process_sample(
     } else {
         &sample.timestamps_unix_nano[..]
     };
-
-    let comm = get_attr(
-        &dict.string_table,
-        &dict.attribute_table,
-        sample.attribute_indices.to_vec(),
-        "thread.name",
-    );
 
     let mut event_batch = DB.trace_events.batched_insert();
     for timestamp in timestamps {
@@ -400,7 +476,7 @@ fn process_sample(
                 timestamp,
                 trace_hash,
                 count: 1,
-                comm: comm.clone().unwrap_or_default().to_owned(),
+                comm: comm.unwrap_or_default().to_owned(),
                 pod_name: None,
                 container_name: None,
             },

@@ -114,6 +114,16 @@ it to `127.0.0.1:11000`, the connection will be forwarded to your local devfiler
 
 [ssh reverse tunnel]: https://unix.stackexchange.com/questions/46235/how-does-reverse-ssh-tunneling-work
 
+### Adding symbols for native executables
+
+devfiler automatically tries to ingest native symbols from
+`process.executable.path` in incoming OTLP samples (when the executable is
+accessible on the local filesystem).
+
+If auto-ingestion cannot resolve the executable path, symbols can still be added
+manually by navigating to the "Executables" tab and dragging and dropping the
+executable anywhere within the tab.
+
 ## Developer mode
 
 Some of the more internal tabs that are only relevant to developers are hidden by default. You can

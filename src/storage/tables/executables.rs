@@ -34,6 +34,7 @@ pub enum SymbStatus {
 pub struct ExecutableMeta {
     pub build_id: Option<String>,
     pub file_name: Option<String>,
+    pub executable_path: Option<String>,
     pub symb_status: SymbStatus,
 }
 
