@@ -99,9 +99,7 @@ pub struct TraceCount {
     pub container_name: Option<String>,
 }
 
-new_table!(TraceEvents: TraceCountId => TraceCount {
-    const STORAGE_OPT: StorageOpt = StorageOpt::SeqRead;
-});
+new_table!(TraceEvents: TraceCountId => TraceCount);
 
 impl TraceEvents {
     /// Iterate over events in the given time range.
@@ -213,3 +211,105 @@ pub struct SampledTrace {
 
 /// List of `(timestamp, count)` buckets.
 pub type EventCountBuckets = Vec<(UtcTimestamp, u64)>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_trace_count(ts: UtcTimestamp, trace_hash: TraceHash, count: u32) -> TraceCount {
+        TraceCount {
+            timestamp: ts,
+            trace_hash,
+            count,
+            comm: "test".to_owned(),
+            pod_name: None,
+            container_name: None,
+        }
+    }
+
+    #[test]
+    fn time_range_filters_and_orders_events() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table = open_or_create::<TraceEvents>(temp_dir.path()).unwrap();
+
+        table.insert(
+            TraceCountId {
+                timestamp: 100,
+                kind: SampleKind::OffCPU,
+                id: 3,
+            },
+            mk_trace_count(100, TraceHash(30), 1),
+        );
+        table.insert(
+            TraceCountId {
+                timestamp: 101,
+                kind: SampleKind::OnCPU,
+                id: 2,
+            },
+            mk_trace_count(101, TraceHash(20), 1),
+        );
+        table.insert(
+            TraceCountId {
+                timestamp: 102,
+                kind: SampleKind::UProbe,
+                id: 1,
+            },
+            mk_trace_count(102, TraceHash(10), 1),
+        );
+
+        let mixed: Vec<_> = table
+            .time_range(100, 103, SampleKind::Mixed)
+            .map(|(k, _)| (k.timestamp, k.kind))
+            .collect();
+        assert_eq!(
+            mixed,
+            vec![
+                (100, SampleKind::OffCPU),
+                (101, SampleKind::OnCPU),
+                (102, SampleKind::UProbe)
+            ]
+        );
+
+        let on_cpu: Vec<_> = table
+            .time_range(100, 103, SampleKind::OnCPU)
+            .map(|(k, _)| (k.timestamp, k.kind))
+            .collect();
+        assert_eq!(on_cpu, vec![(101, SampleKind::OnCPU)]);
+    }
+
+    #[test]
+    fn event_count_buckets_sums_inserted_counts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table = open_or_create::<TraceEvents>(temp_dir.path()).unwrap();
+
+        table.insert(
+            TraceCountId {
+                timestamp: 100,
+                kind: SampleKind::OnCPU,
+                id: 11,
+            },
+            mk_trace_count(100, TraceHash(1), 2),
+        );
+        table.insert(
+            TraceCountId {
+                timestamp: 101,
+                kind: SampleKind::OffCPU,
+                id: 12,
+            },
+            mk_trace_count(101, TraceHash(2), 3),
+        );
+        table.insert(
+            TraceCountId {
+                timestamp: 102,
+                kind: SampleKind::OnCPU,
+                id: 13,
+            },
+            mk_trace_count(102, TraceHash(3), 4),
+        );
+
+        let buckets = table.event_count_buckets(SampleKind::Mixed, 100, 103, 3);
+        let total: u64 = buckets.iter().map(|(_, n)| *n).sum();
+
+        assert_eq!(total, 9);
+    }
+}

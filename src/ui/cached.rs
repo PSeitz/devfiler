@@ -105,14 +105,19 @@ impl<V: Default> Cached<V> {
         // We elected ourselves as the one responsible for construction.
         let this = Arc::clone(&self.0);
         tokio::task::spawn_blocking(move || {
-            let new_value = create();
-            this.value.store(Arc::new(CachedValue {
-                created: Utc::now(),
-                input_hash: new_input_hash,
-                value: new_value,
-            }));
+            let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(create));
+            if let Ok(new_value) = computed {
+                this.value.store(Arc::new(CachedValue {
+                    created: Utc::now(),
+                    input_hash: new_input_hash,
+                    value: new_value,
+                }));
+                UPDATE_CTR.fetch_add(1, SeqCst);
+            } else {
+                tracing::debug!("Cached background recompute panicked");
+            }
+
             this.being_constructed.store(false, SeqCst);
-            UPDATE_CTR.fetch_add(1, SeqCst);
         });
 
         CachedValueRef(value)
@@ -142,5 +147,23 @@ impl UpdateWatcher {
         let new_ctr = UPDATE_CTR.load(SeqCst);
         let old_ctr = std::mem::replace(&mut self.prev_ctr, new_ctr);
         new_ctr != old_ctr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn panic_in_builder_does_not_poison_cache() {
+        let cache = Cached::<u64>::default();
+
+        let _ = cache.get_or_create(123_u64, || panic!("boom"));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let _ = cache.get_or_create(123_u64, || 42);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(*cache.get_or_create(123_u64, || 999), 42);
     }
 }

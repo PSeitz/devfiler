@@ -15,295 +15,264 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Defines a higher-level, typed wrapper around [`rocksdb`].
-//!
-//! RocksDB is semantically just a persistent `BTreeMap<[u8], [u8]>`. There's no
-//! notion of tables or columns in the traditional sense. This module provides
-//! types and helpers to allow turning it into something that is more like a
-//! `BTreeMap<K, V>`, with strong typing and automatic de/serialization.
+//! Typed wrappers over redb tables.
 
-use lru::LruCache;
+use redb::ReadableTable;
 use rkyv::ser::serializers::AllocSerializer;
 use smallvec::SmallVec;
 use std::fmt;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
 
-/// Raw, untyped database table.
+const DATA_TABLE: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("data");
+
+/// Raw, untyped table access.
 pub trait RawTable {
-    /// Raw access to the underlying RocksDB.
-    ///
-    /// You should typically avoid using this directly outside of
-    /// temporary experiments: it breaks the DB abstraction.
-    fn raw(&self) -> &rocksdb::DB;
+    /// Underlying redb database.
+    fn db(&self) -> &Arc<redb::Database>;
 
-    /// Access to the LRU cache for this table.
-    ///
-    /// The cache stores serialized values to avoid deserialization overhead
-    /// and to work with the existing TableValueRef API.
-    fn cache(&self) -> &Mutex<LruCache<Vec<u8>, Vec<u8>>>;
+    /// In-process sequence counter used by `UpdateWatcher`.
+    fn seq_ctr(&self) -> &AtomicU64;
 
-    /// Clear the entire cache.
-    /// Helper function for tests only so far.
-    #[allow(dead_code)]
-    fn clear_cache(&self) {
-        let mut cache = self.cache().lock().unwrap();
-        cache.clear();
-    }
-
-    /// Estimate the number of records in this table.
-    fn count_estimate(&self) -> u64 {
-        self.raw()
-            .property_int_value(rocksdb::properties::ESTIMATE_NUM_KEYS)
-            .unwrap()
-            .unwrap()
-    }
-
-    /// Return database statistics in RocksDB's string format.
-    ///
-    /// This isn't meant to be processed programmatically, but only for
-    /// human consumption.
-    fn rocksdb_statistics(&self) -> String {
-        self.raw()
-            .property_value(rocksdb::properties::STATS)
-            .unwrap()
-            .unwrap()
-    }
-
-    /// Return the latest sequence number of the table.
-    ///
-    /// This is increased on every update transaction, after commit.
+    /// Return the latest in-process sequence number of this table.
     fn last_seq(&self) -> u64 {
-        self.raw().latest_sequence_number()
+        self.seq_ctr().load(Relaxed)
     }
 
-    /// Gets the pretty name of the table.
-    ///
-    /// By default it is derived from the type name.
+    /// Increase sequence number after successful write commit.
+    fn bump_seq(&self) {
+        self.seq_ctr().fetch_add(1, Relaxed);
+    }
+
+    /// Estimate number of records in this table.
+    fn count_estimate(&self) -> u64 {
+        count_entries(self.db()).unwrap_or(0)
+    }
+
+    /// Debug statistics string.
+    fn rocksdb_statistics(&self) -> String {
+        format!(
+            "backend=redb keys={} seq={}",
+            self.count_estimate(),
+            self.last_seq()
+        )
+    }
+
+    /// Pretty table name.
     fn pretty_name(&self) -> &'static str {
         table_name::<Self>()
     }
 }
 
-/// Derive the table name from the type name.
-fn table_name<T: ?Sized>() -> &'static str {
-    let full = std::any::type_name::<T>();
-    let name = full.rsplit_once("::").map(|x| x.1).unwrap();
-    assert!(name.chars().all(|c| c.is_ascii_alphanumeric()));
-    assert!(!name.is_empty());
-    name
-}
-
-// Make sure that `RawTable` remains object safe.
+// Make sure `RawTable` remains object safe.
 #[allow(unused)]
 fn assert_raw_table_obj_safe(_: &dyn RawTable) {}
 
 /// Typed database table.
-pub trait Table: RawTable + Sized + From<rocksdb::DB> {
+pub trait Table: RawTable + Sized + From<Arc<redb::Database>> {
     /// Key format.
     type Key: TableKey;
 
     /// Value format.
     type Value: rkyv::Archive + rkyv::Serialize<AllocSerializer<4096>> + 'static;
 
-    /// Defines the table's merge behavior.
-    const MERGE_OP: MergeOperator<Self> = MergeOperator::Default;
-
-    /// Defines the table's storage optimization.
-    const STORAGE_OPT: StorageOpt = StorageOpt::RandomAccess;
-
-    /// LRU cache size for this table. Set to 0 to disable caching.
-    const CACHE_SIZE: usize = 16384;
-
-    /// Removes the record with the given key from the table.
+    /// Removes the record with the given key.
     fn remove(&self, key: Self::Key) {
         let key_raw = key.into_raw();
-
-        // Remove from cache
-        if Self::CACHE_SIZE > 0 {
-            let mut cache = self.cache().lock().unwrap();
-            cache.pop(key_raw.as_ref());
+        let write_txn = self.db().begin_write().expect("DB write begin failed");
+        {
+            let mut table = write_txn
+                .open_table(DATA_TABLE)
+                .expect("DB open table failed");
+            table.remove(key_raw.as_ref()).expect("DB delete failed");
         }
-
-        self.raw().delete(key_raw).unwrap();
+        write_txn.commit().expect("DB write commit failed");
+        self.bump_seq();
     }
 
-    /// Inserts the given value at the given key.
-    ///
-    /// If the record already exists, the previous value is replaced.
+    /// Inserts value at key.
     fn insert(&self, key: Self::Key, value: Self::Value) {
         let key_raw = key.into_raw();
-        let value_bytes = rkyv::to_bytes(&value).unwrap();
+        let value_bytes = serialize_value(&value);
 
-        // Update cache
-        if Self::CACHE_SIZE > 0 {
-            let mut cache = self.cache().lock().unwrap();
-            cache.put(key_raw.as_ref().to_vec(), value_bytes.to_vec());
+        let write_txn = self.db().begin_write().expect("DB write begin failed");
+        {
+            let mut table = write_txn
+                .open_table(DATA_TABLE)
+                .expect("DB open table failed");
+            table
+                .insert(key_raw.as_ref(), value_bytes.as_ref())
+                .expect("DB put failed");
         }
-
-        match Self::MERGE_OP {
-            MergeOperator::Default => self.raw().put(key_raw, value_bytes).unwrap(),
-            MergeOperator::Associative(_) => self.raw().merge(key_raw, value_bytes).unwrap(),
-        }
+        write_txn.commit().expect("DB write commit failed");
+        self.bump_seq();
     }
 
     /// Create a new insertion batch.
     fn batched_insert(&self) -> InsertionBatch<'_, Self> {
-        InsertionBatch(self, rocksdb::WriteBatch::default())
+        InsertionBatch {
+            table: self,
+            rows: Vec::with_capacity(1024),
+        }
     }
 
-    /// Get the value at the given key.
-    ///
-    /// Returns `None` if the key isn't present.
+    /// Get value at key.
     fn get(&self, key: Self::Key) -> Option<TableValueRef<Self::Value, SmallVec<[u8; 64]>>> {
         let key_raw = key.into_raw();
 
-        // Check cache first if caching is enabled
-        if Self::CACHE_SIZE > 0 {
-            let mut cache = self.cache().lock().unwrap();
-            if let Some(cached_value) = cache.get(key_raw.as_ref()) {
-                let value = SmallVec::from_slice(cached_value);
-                return Some(TableValueRef::new(value));
-            }
-        }
+        let read_txn = self.db().begin_read().expect("DB read begin failed");
+        let table = read_txn
+            .open_table(DATA_TABLE)
+            .expect("DB open table failed");
 
-        // Cache miss, get from RocksDB
-        let mut opts = rocksdb::ReadOptions::default();
-        opts.set_readahead_size(0);
-        opts.set_verify_checksums(false);
-        let raw = self.raw().get_pinned_opt(key_raw.as_ref(), &opts);
-        let raw = raw.expect("DB IO error")?;
+        let value = table
+            .get(key_raw.as_ref())
+            .expect("DB read failed")?
+            .value()
+            .to_vec();
 
-        // Store in cache if caching is enabled
-        if Self::CACHE_SIZE > 0 {
-            let mut cache = self.cache().lock().unwrap();
-            cache.put(key_raw.as_ref().to_vec(), raw.as_ref().to_vec());
-        }
-
-        let value = SmallVec::from_slice(raw.as_ref());
-        Some(TableValueRef::new(value))
+        Some(TableValueRef::new(SmallVec::from_vec(value)))
     }
 
-    /// Checks whether the given key exists in the DB.
+    /// Checks whether key exists.
     fn contains_key(&self, key: Self::Key) -> bool {
-        self.get(key).is_some() // TODO: better impl
+        self.get(key).is_some()
     }
 
-    /// Iterate over all key-value pairs in the database.
-    ///
-    /// Iteration is performed in ascending, **lexicographic** order after
-    /// converting the key into a byte array. The order thus depends on how
-    /// your [`TableKey`] implementation chose to represent the fields in
-    /// the output array.
-    fn iter(&self) -> Iter<'_, Self> {
-        let mut raw = self.raw().raw_iterator();
-        raw.seek_to_first();
+    /// Iterate over all key-value pairs.
+    fn iter(&self) -> Iter<Self> {
+        let read_txn = self.db().begin_read().expect("DB read begin failed");
+        let table = read_txn
+            .open_table(DATA_TABLE)
+            .expect("DB open table failed");
+
+        let mut out = Vec::new();
+        let rows = table.iter().expect("DB iter failed");
+        for row in rows {
+            let (key, value) = row.expect("DB iter row failed");
+            out.push(decode_row::<Self>(key.value(), value.value()));
+        }
+
         Iter {
-            raw,
-            _marker: PhantomData,
+            raw: out.into_iter(),
         }
     }
 
-    /// Iterate over key-value pairs in the `[start, end)` range.
+    /// Iterate over key-value pairs in `[start, end)`.
     fn range(&self, start: Self::Key, end: Self::Key) -> Iter<Self> {
-        let mut opts = rocksdb::ReadOptions::default();
-        opts.set_iterate_range(start.into_raw().as_ref()..end.into_raw().as_ref());
-        opts.set_async_io(true);
-        let mut raw = self.raw().raw_iterator_opt(opts);
-        raw.seek_to_first();
+        let start_raw = start.into_raw();
+        let end_raw = end.into_raw();
+
+        let read_txn = self.db().begin_read().expect("DB read begin failed");
+        let table = read_txn
+            .open_table(DATA_TABLE)
+            .expect("DB open table failed");
+
+        let mut out = Vec::new();
+        let rows = table
+            .range(start_raw.as_ref()..end_raw.as_ref())
+            .expect("DB range failed");
+        for row in rows {
+            let (key, value) = row.expect("DB range row failed");
+            out.push(decode_row::<Self>(key.value(), value.value()));
+        }
+
         Iter {
-            raw,
-            _marker: PhantomData,
+            raw: out.into_iter(),
         }
     }
 }
 
-/// Defines what to optimize the table for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StorageOpt {
-    /// Random access key-value lookups.
-    RandomAccess,
+fn count_entries(db: &redb::Database) -> anyhow::Result<u64> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(DATA_TABLE)?;
 
-    /// Sequential full-table or range reads.
-    SeqRead,
+    let mut count = 0;
+    for _ in table.iter()? {
+        count += 1;
+    }
+
+    Ok(count)
 }
 
-/// Merge operator function defining how to combine multiple DB values into one.
-pub type MergeFn<T> = fn(
-    key: <T as Table>::Key,
-    prev: Option<TableValueRef<<T as Table>::Value, &[u8]>>,
-    values: &mut dyn Iterator<Item = TableValueRef<<T as Table>::Value, &[u8]>>,
-) -> Option<<T as Table>::Value>;
-
-/// Defines how a table merges with existing values.
-///
-/// Note: RocksDB also supports non-associative merge operators, but we
-/// currently don't need those and don't have wrapping for them.
-#[derive(Debug, Default)]
-pub enum MergeOperator<T: Table> {
-    /// Use the default RocksDB merge operator that just replaces the old value.
-    #[default]
-    Default,
-
-    /// Custom associative merge operator.
-    #[allow(dead_code)]
-    Associative(MergeFn<T>),
+fn serialize_value<T>(value: &T) -> SmallVec<[u8; 64]>
+where
+    T: rkyv::Archive + rkyv::Serialize<AllocSerializer<4096>>,
+{
+    let bytes = rkyv::to_bytes::<_, 4096>(value).expect("rkyv serialization failed");
+    SmallVec::from_slice(bytes.as_ref())
 }
 
-/// Iterator over key-value pairs in the database.
-///
-/// Created via [`Table::iter`] or [`Table::range`].
-pub struct Iter<'db, T: Table> {
-    raw: rocksdb::DBRawIteratorWithThreadMode<'db, rocksdb::DB>,
-    _marker: PhantomData<T>,
+fn decode_row<T: Table>(
+    key_raw: &[u8],
+    value_raw: &[u8],
+) -> (T::Key, TableValueRef<T::Value, SmallVec<[u8; 64]>>) {
+    let key_raw = match <T::Key as TableKey>::B::try_from(key_raw) {
+        Ok(key_raw) => key_raw,
+        Err(_) => panic!("bug: key size mismatch"),
+    };
+    let key = <T::Key as TableKey>::from_raw(key_raw);
+
+    let value = SmallVec::from_slice(value_raw);
+    let value = TableValueRef::new(value);
+
+    (key, value)
 }
 
-impl<'db, T: Table> Iterator for Iter<'db, T> {
+/// Iterator over key-value pairs.
+pub struct Iter<T: Table> {
+    raw: std::vec::IntoIter<(T::Key, TableValueRef<T::Value, SmallVec<[u8; 64]>>)>,
+}
+
+impl<T: Table> Iterator for Iter<T> {
     type Item = (T::Key, TableValueRef<T::Value, SmallVec<[u8; 64]>>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Some((key, value)) = self.raw.key().zip(self.raw.value()) else {
-            return None;
-        };
-
-        let key = <T::Key as TableKey>::B::try_from(key).unwrap_or_else(|_| panic!());
-        let key = <T::Key as TableKey>::from_raw(key);
-
-        let value = SmallVec::from_slice(value);
-        let value = TableValueRef::new(value);
-
-        // Advance iterator for next iteration.
-        self.raw.next();
-
-        Some((key, value))
+        self.raw.next()
     }
 }
 
-impl<T: Table> FusedIterator for Iter<'_, T> {}
+impl<T: Table> FusedIterator for Iter<T> {}
 
-pub struct InsertionBatch<'table, T: Table>(&'table T, rocksdb::WriteBatch);
+/// Batched insertion helper.
+pub struct InsertionBatch<'table, T: Table> {
+    table: &'table T,
+    rows: Vec<(T::Key, SmallVec<[u8; 64]>)>,
+}
 
 impl<T: Table> InsertionBatch<'_, T> {
-    /// Add a record to the insertion batch.
+    /// Add a record to the batch.
     pub fn insert(&mut self, key: T::Key, value: T::Value) {
-        let value = rkyv::to_bytes(&value).unwrap();
-        match T::MERGE_OP {
-            MergeOperator::Default => self.1.put(key.into_raw(), value),
-            MergeOperator::Associative(_) => self.1.merge(key.into_raw(), value),
-        }
+        self.rows.push((key, serialize_value(&value)));
     }
 
     /// Atomically insert the batch.
     pub fn commit(self) {
-        self.0.raw().write(self.1).unwrap();
-
-        // Clear cache after batch operations since we don't track individual keys
-        if T::CACHE_SIZE > 0 {
-            let mut cache = self.0.cache().lock().unwrap();
-            cache.clear();
+        if self.rows.is_empty() {
+            return;
         }
+
+        let write_txn = self
+            .table
+            .db()
+            .begin_write()
+            .expect("DB write begin failed");
+        {
+            let mut table = write_txn
+                .open_table(DATA_TABLE)
+                .expect("DB open table failed");
+            for (key, value) in self.rows {
+                let key_raw = key.into_raw();
+                table
+                    .insert(key_raw.as_ref(), value.as_ref())
+                    .expect("DB batch put failed");
+            }
+        }
+        write_txn.commit().expect("DB write commit failed");
+        self.table.bump_seq();
     }
 }
 
@@ -312,37 +281,25 @@ impl<T: Table> fmt::Debug for InsertionBatch<'_, T> {
         write!(
             f,
             "InsertionBatch(<{} records into {}>)",
-            self.1.len(),
+            self.rows.len(),
             std::any::type_name::<T>(),
         )
     }
 }
 
-/// Type that can act as the key for a [`Table`].
-///
-/// Defines how a given type is to be converted into a raw byte array. The
-/// chosen byte representation also defines the iteration order and behavior
-/// of [`Table::range`] functions. Tables are ordered in lexicographic order
-/// of the keys after conversion via [`Self::into_raw`].
-///
-/// You'll want to **output all integer keys with ordinal semantics in big
-/// endian to ensure that the ordering works correctly**.
+/// Type that can act as key for a table.
 pub trait TableKey: 'static {
-    /// Container type for the raw representation of the key.
-    ///
-    /// Typically `[u8; N]`, but can also be something dynamic like `Vec<u8>`.
+    /// Container type for raw key representation.
     type B: for<'a> TryFrom<&'a [u8]> + AsRef<[u8]>;
 
-    /// Load the raw container as a typed value.
+    /// Load raw key as typed value.
     fn from_raw(data: Self::B) -> Self;
 
-    /// Store the typed value as the raw container.
+    /// Store typed key as raw bytes.
     fn into_raw(self) -> Self::B;
 }
 
 /// Implements Rust ordering trait via the table key.
-///
-/// Ensures that ordering behaves the same as in RocksDB.
 #[macro_export]
 macro_rules! impl_ord_from_table_key {
     ($ty:ty) => {
@@ -360,7 +317,7 @@ macro_rules! impl_ord_from_table_key {
     };
 }
 
-/// Reference to a table value, with lazy deserialization.
+/// Reference to table value with lazy deserialization.
 pub struct TableValueRef<T: rkyv::Archive, S: AsRef<[u8]>> {
     data: S,
     _marker: PhantomData<(T::Archived, S)>,
@@ -375,12 +332,12 @@ impl<T: rkyv::Archive, S: AsRef<[u8]>> TableValueRef<T, S> {
         }
     }
 
-    /// Borrowed access to the data (no copy, cheap).
+    /// Borrowed access to archived data.
     pub fn get(&self) -> &T::Archived {
         unsafe { rkyv::archived_root::<T>(self.data.as_ref()) }
     }
 
-    /// Deserialize the value into an owned object.
+    /// Deserialize into owned object.
     pub fn read(&self) -> T
     where
         <T as rkyv::Archive>::Archived:
@@ -390,23 +347,32 @@ impl<T: rkyv::Archive, S: AsRef<[u8]>> TableValueRef<T, S> {
     }
 }
 
-/// Convenience macro for defining a new table.
+/// Derive table name from type name.
+fn table_name<T: ?Sized>() -> &'static str {
+    let full = std::any::type_name::<T>();
+    let name = full.rsplit_once("::").map(|x| x.1).unwrap();
+    assert!(name.chars().all(|c| c.is_ascii_alphanumeric()));
+    assert!(!name.is_empty());
+    name
+}
+
+/// Convenience macro for defining a table wrapper.
 #[macro_export]
 macro_rules! new_table {
     ($name:ident: $key:ty => $value:ty $({ $($custom:tt)* })?) => {
         #[derive(::std::fmt::Debug)]
         pub struct $name {
-            db: ::rocksdb::DB,
-            cache: ::std::sync::Mutex<::lru::LruCache<Vec<u8>, Vec<u8>>>,
+            db: ::std::sync::Arc<::redb::Database>,
+            seq: ::std::sync::atomic::AtomicU64,
         }
 
         impl $crate::storage::RawTable for $name {
-            fn raw(&self) -> &::rocksdb::DB {
+            fn db(&self) -> &::std::sync::Arc<::redb::Database> {
                 &self.db
             }
 
-            fn cache(&self) -> &::std::sync::Mutex<::lru::LruCache<Vec<u8>, Vec<u8>>> {
-                &self.cache
+            fn seq_ctr(&self) -> &::std::sync::atomic::AtomicU64 {
+                &self.seq
             }
         }
 
@@ -417,112 +383,43 @@ macro_rules! new_table {
             $($($custom)*)*
         }
 
-        impl ::std::convert::From<::rocksdb::DB> for $name {
-            fn from(db: ::rocksdb::DB) -> Self {
-                let cache_size = <Self as $crate::storage::Table>::CACHE_SIZE;
-                let cache = if cache_size > 0 {
-                    ::std::sync::Mutex::new(::lru::LruCache::new(
-                        ::std::num::NonZeroUsize::new(cache_size).unwrap()
-                    ))
-                } else {
-                    ::std::sync::Mutex::new(::lru::LruCache::new(
-                        ::std::num::NonZeroUsize::new(1).unwrap()
-                    ))
-                };
-                Self { db, cache }
+        impl ::std::convert::From<::std::sync::Arc<::redb::Database>> for $name {
+            fn from(db: ::std::sync::Arc<::redb::Database>) -> Self {
+                Self {
+                    db,
+                    seq: ::std::sync::atomic::AtomicU64::new(0),
+                }
             }
         }
     };
 }
 
-/// Open or create a table in the given target directory.
+/// Open or create a table database in target directory.
 pub fn open_or_create<T: Table>(dir: &Path) -> anyhow::Result<T> {
-    use rocksdb::{BlockBasedOptions, DBCompressionType, DataBlockIndexType, Options};
+    let path = dir.join(format!("{}.redb", table_name::<T>()));
 
-    // `BlockBasedOptions` doesn't impl `Clone`.
-    macro_rules! common_block {
-        () => {{
-            let mut opt = BlockBasedOptions::default();
-            opt.set_bloom_filter(10.0, false);
-            opt.set_format_version(5);
-            opt.set_data_block_index_type(DataBlockIndexType::BinaryAndHash);
-            opt
-        }};
-    }
-
-    lazy_static::lazy_static! {
-        static ref COMMON_BLOCK: BlockBasedOptions = common_block!();
-
-        static ref COMMON: Options = {
-            let mut opt = Options::default();
-            opt.create_if_missing(true);
-            opt.set_allow_mmap_reads(true);
-            opt.set_unordered_write(true);
-            opt.set_block_based_table_factory(&COMMON_BLOCK);
-            opt
-        };
-
-        static ref SEQ_READ_BLOCK: BlockBasedOptions = {
-            let mut opt = common_block!();
-            opt.set_block_size(256 * 1024); // 256KiB
-            opt
-        };
-
-        static ref SEQ_READ: Options = {
-            let mut opt = COMMON.clone();
-            opt.set_compression_type(DBCompressionType::Zstd);
-            opt.set_advise_random_on_open(false);
-            opt.set_block_based_table_factory(&SEQ_READ_BLOCK);
-            opt
-        };
-    }
-
-    let mut opt = match T::STORAGE_OPT {
-        StorageOpt::RandomAccess => COMMON.clone(),
-        StorageOpt::SeqRead => SEQ_READ.clone(),
+    let db = if path.exists() {
+        redb::Database::open(&path)?
+    } else {
+        redb::Database::create(&path)?
     };
 
-    if let MergeOperator::Associative(op) = T::MERGE_OP {
-        let name = std::ffi::CStr::from_bytes_with_nul(b"custom\0").unwrap();
-        opt.set_merge_operator(name, wrap_merge::<T>(op), wrap_merge::<T>(op));
+    // Ensure the data table exists.
+    {
+        let write_txn = db.begin_write()?;
+        {
+            let _ = write_txn.open_table(DATA_TABLE)?;
+        }
+        write_txn.commit()?;
     }
 
-    let path = dir.join(table_name::<T>());
-    let raw = rocksdb::DB::open(&opt, path)?;
-
-    Ok(T::from(raw))
-}
-
-fn wrap_merge<T: Table>(func: MergeFn<T>) -> Box<dyn rocksdb::merge_operator::MergeFn> {
-    Box::new(move |key, prev, values| {
-        let Ok(key) = key.try_into() else {
-            // Note: `.expect()` doesn't work here because the key
-            // doesn't have a `Debug` constraint
-            panic!("bug: key size mismatch");
-        };
-
-        let key = T::Key::from_raw(key);
-
-        let prev = prev.map(TableValueRef::<T::Value, _>::new);
-
-        let mut values = values.iter();
-        let mut values = std::iter::from_fn(move || {
-            let value = values.next()?;
-            Some(TableValueRef::<T::Value, _>::new(value))
-        });
-
-        let merged = func(key, prev, &mut values)?;
-
-        // TODO: better to use N = 0 here
-        Some(rkyv::to_bytes(&merged).unwrap().to_vec())
-    })
+    Ok(T::from(Arc::new(db)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Simple test key type
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct TestKey(u64);
 
@@ -538,159 +435,80 @@ mod tests {
         }
     }
 
-    // Simple test value type
     #[derive(Debug, Clone, PartialEq, Eq)]
     #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     pub struct TestValue {
-        pub data: String,
+        data: String,
     }
 
-    // Test table with caching enabled
-    new_table!(TestTable: TestKey => TestValue {
-        const CACHE_SIZE: usize = 10;
-    });
+    new_table!(TestTable: TestKey => TestValue {});
 
     #[test]
-    fn test_cache_functionality() {
+    fn insert_get_remove_roundtrip() {
         let temp_dir = tempfile::tempdir().unwrap();
         let table = open_or_create::<TestTable>(temp_dir.path()).unwrap();
 
-        let key = TestKey(42);
+        let key = TestKey(7);
         let value = TestValue {
-            data: "hello world".to_string(),
+            data: "abc".to_string(),
         };
 
-        // Insert value
         table.insert(key, value.clone());
+        assert!(table.contains_key(key));
+        assert_eq!(table.get(key).unwrap().read(), value);
 
-        // First get - should load from RocksDB and cache it
-        let retrieved1 = table.get(key).unwrap();
-        assert_eq!(retrieved1.read().data, value.data);
-
-        // Check that cache has the item
-        let cache = table.cache().lock().unwrap();
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.cap().get(), 10);
-        drop(cache);
-
-        // Second get - should come from cache (much faster)
-        let retrieved2 = table.get(key).unwrap();
-        assert_eq!(retrieved2.read().data, value.data);
-
-        // Cache should still have 1 item
-        let cache = table.cache().lock().unwrap();
-        assert_eq!(cache.len(), 1);
-        drop(cache);
-
-        // Remove the key - should clear from cache
         table.remove(key);
+        assert!(!table.contains_key(key));
         assert!(table.get(key).is_none());
     }
 
     #[test]
-    fn test_cache_lru_eviction() {
+    fn range_is_ordered_and_bounded() {
         let temp_dir = tempfile::tempdir().unwrap();
         let table = open_or_create::<TestTable>(temp_dir.path()).unwrap();
 
-        // Insert more than cache capacity
-        for i in 0..15 {
-            let key = TestKey(i);
-            let value = TestValue {
-                data: format!("value_{}", i),
-            };
-            table.insert(key, value);
+        for i in 0..10 {
+            table.insert(
+                TestKey(i),
+                TestValue {
+                    data: format!("v{i}"),
+                },
+            );
         }
 
-        // Cache should be at capacity
-        let cache = table.cache().lock().unwrap();
-        assert_eq!(cache.len(), 10);
-        assert_eq!(cache.cap().get(), 10);
-        drop(cache);
+        let out: Vec<_> = table
+            .range(TestKey(3), TestKey(7))
+            .map(|(k, v)| (k.0, v.read().data))
+            .collect();
 
-        // Clear cache and verify
-        table.clear_cache();
-        let cache = table.cache().lock().unwrap();
-        assert_eq!(cache.len(), 0);
-        drop(cache);
+        assert_eq!(
+            out,
+            vec![
+                (3, "v3".to_string()),
+                (4, "v4".to_string()),
+                (5, "v5".to_string()),
+                (6, "v6".to_string())
+            ]
+        );
     }
 
     #[test]
-    fn test_cache_performance_benefit() {
+    fn batched_insert_works() {
         let temp_dir = tempfile::tempdir().unwrap();
         let table = open_or_create::<TestTable>(temp_dir.path()).unwrap();
 
-        // Insert test data
-        let key = TestKey(999);
-        let value = TestValue {
-            data: "performance_test_value".to_string(),
-        };
-        table.insert(key, value.clone());
+        let mut batch = table.batched_insert();
+        for i in 100..110 {
+            batch.insert(
+                TestKey(i),
+                TestValue {
+                    data: format!("b{i}"),
+                },
+            );
+        }
+        batch.commit();
 
-        // First get - loads from RocksDB and caches
-        let start = std::time::Instant::now();
-        let result1 = table.get(key).unwrap();
-        let first_get_time = start.elapsed();
-        assert_eq!(result1.read().data, value.data);
-
-        // Verify item is now in cache
-        let cache = table.cache().lock().unwrap();
-        assert_eq!(cache.len(), 1);
-        drop(cache);
-
-        // Second get - should be faster (from cache)
-        let start = std::time::Instant::now();
-        let result2 = table.get(key).unwrap();
-        let second_get_time = start.elapsed();
-        assert_eq!(result2.read().data, value.data);
-
-        // Cache should still have 1 item
-        let cache = table.cache().lock().unwrap();
-        assert_eq!(cache.len(), 1);
-        drop(cache);
-
-        println!("First get (RocksDB): {:?}", first_get_time);
-        println!("Second get (cache): {:?}", second_get_time);
-
-        // While we can't guarantee cache is always faster in a test environment,
-        // we can at least verify that the cache is being used correctly
-        assert!(second_get_time.as_nanos() > 0);
-    }
-
-    #[test]
-    fn test_cache_basic_usage() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let table = open_or_create::<TestTable>(temp_dir.path()).unwrap();
-
-        // Insert test data
-        let key1 = TestKey(100);
-        let key2 = TestKey(200);
-        let key3 = TestKey(300); // This key won't exist
-
-        let value1 = TestValue {
-            data: "value1".to_string(),
-        };
-        let value2 = TestValue {
-            data: "value2".to_string(),
-        };
-
-        table.insert(key1, value1);
-        table.insert(key2, value2);
-
-        // Clear cache to start fresh
-        table.clear_cache();
-
-        // First access - should load from RocksDB and cache
-        let _ = table.get(key1).unwrap();
-        let _ = table.get(key2).unwrap();
-        let _ = table.get(key3); // Should return None
-
-        // Second access - should come from cache
-        let _ = table.get(key1).unwrap();
-        let _ = table.get(key2).unwrap();
-
-        // Check that cache contains our items
-        let cache = table.cache().lock().unwrap();
-        assert_eq!(cache.len(), 2); // key1 and key2 should be cached
-        drop(cache);
+        assert_eq!(table.count_estimate(), 10);
+        assert_eq!(table.last_seq(), 1);
     }
 }

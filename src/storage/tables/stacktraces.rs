@@ -172,10 +172,7 @@ impl From<ArchivedFrame> for Frame {
     }
 }
 
-new_table!(StackTraces: TraceHash => Vec<Frame> {
-    // Stack traces are frequently accessed during profiling, so use a large cache
-    const CACHE_SIZE: usize = 8192;
-});
+new_table!(StackTraces: TraceHash => Vec<Frame>);
 
 #[cfg(test)]
 mod tests {

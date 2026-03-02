@@ -61,15 +61,10 @@ pub fn gui_thread(collector: crate::collector::Collector) -> Result<(), eframe::
 }
 
 async fn background_ui_waker(ctx: egui::Context) {
-    let mut db_watcher = crate::storage::UpdateWatcher::default();
-    let mut cache_watcher = cached::UpdateWatcher::default();
-    let freq = std::time::Duration::from_millis(50);
+    let freq = std::time::Duration::from_secs(1);
 
     loop {
-        if db_watcher.any_changes() || cache_watcher.any_caches() {
-            ctx.request_repaint();
-        }
-
+        ctx.request_repaint();
         tokio::time::sleep(freq).await;
     }
 }

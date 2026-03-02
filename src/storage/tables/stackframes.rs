@@ -67,7 +67,4 @@ pub struct FrameMetaData {
     pub function_offset: u32, // TODO: option
 }
 
-new_table!(StackFrames: FrameId => FrameMetaData {
-    // Stack frames are frequently accessed for symbolization, so use a larger cache
-    const CACHE_SIZE: usize = 16384;
-});
+new_table!(StackFrames: FrameId => FrameMetaData);
