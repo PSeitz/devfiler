@@ -157,7 +157,7 @@ struct FlameGraphWidget {
 struct SandwichView {
     #[allow(dead_code)]
     selected_frame: FrameId,
-    selected_text: String,
+    selected_label: String,
     callers: FlameGraphNode,
     callees: FlameGraphNode,
 }
@@ -274,7 +274,7 @@ impl FlameGraphWidget {
         painter.text(
             to_screen * selected_rect.min + vec2(4.0, 4.0),
             Align2::LEFT_TOP,
-            &sandwich.selected_text,
+            &sandwich.selected_label,
             FontId::monospace(11.0),
             Color32::BLACK,
         );
@@ -321,7 +321,7 @@ impl FlameGraphWidget {
                 painter.with_clip_rect(screen_rect).text(
                     to_screen * rect.min + vec2(4.0, 4.0),
                     Align2::LEFT_TOP,
-                    &node.text,
+                    &node.label,
                     FontId::monospace(11.0),
                     node.fg_color,
                 );
@@ -511,7 +511,7 @@ impl FlameGraphWidget {
         }
 
         let bg_color = if self.filter.len() >= 3 {
-            if flame.text.contains(&self.filter) {
+            if flame.label.contains(&self.filter) {
                 flame.bg_color
             } else {
                 flame.bg_color.gamma_multiply(0.5)
@@ -521,7 +521,7 @@ impl FlameGraphWidget {
         };
 
         // Track matching frames for navigation (only if filter changed)
-        let is_match = self.filter.len() >= 3 && flame.text.contains(&self.filter);
+        let is_match = self.filter.len() >= 3 && flame.label.contains(&self.filter);
         let is_focused = if is_match {
             if self.rebuild_matches {
                 let unscaled_pos = pos2(draw_pos.x / self.x_zoom, draw_pos.y);
@@ -565,7 +565,7 @@ impl FlameGraphWidget {
             painter.with_clip_rect(screen_rect).text(
                 to_screen * rect.min + vec2(4.0, 4.0),
                 Align2::LEFT_TOP,
-                &flame.text,
+                &flame.label,
                 FontId::monospace(11.0),
                 flame.fg_color,
             );
@@ -721,7 +721,7 @@ impl FlameGraphWidget {
             });
             ui.horizontal(|ui| {
                 ui.strong("Location:");
-                ui.add(Label::new(&flame.text).wrap());
+                ui.add(Label::new(&flame.label).wrap());
             });
         });
     }
@@ -797,7 +797,7 @@ struct FlameGraphNode {
     pub fg_color: Color32,
     pub bg_color: Color32,
     pub id: FrameId,
-    pub text: String,
+    pub label: String,
     pub inline_skip: u16,
     pub children: Vec<FlameGraphNode>,
 }
@@ -816,21 +816,75 @@ fn same_executable_path(lhs: FileId, rhs: FileId) -> bool {
     matches!((lhs_path, rhs_path), (Some(lhs), Some(rhs)) if lhs == rhs)
 }
 
-fn node_matches_symbolized_frame(
-    existing: &FlameGraphNode,
-    incoming: &SymbolizedFrame,
-    incoming_text: &str,
-) -> bool {
-    if !matches!(incoming.raw.kind.interp(), Some(InterpKind::Native)) {
-        return existing.id == incoming.raw.id;
-    }
+fn native_symbol_sig_from_frame_id(id: FrameId) -> Option<SymbolizedFrame> {
+    let frame = Frame {
+        id,
+        kind: FrameKind::Regular(InterpKind::Native),
+    };
+    symbolize_frame(frame, false).into_iter().next()
+}
 
-    if existing.text != incoming_text {
+fn node_matches_symbolized_frame(existing: &FlameGraphNode, incoming: &SymbolizedFrame) -> bool {
+    if existing.id == incoming.raw.id {
+        return true;
+    }
+    if !matches!(incoming.raw.kind.interp(), Some(InterpKind::Native)) {
         return false;
     }
+    if !same_executable_path(existing.id.file_id, incoming.raw.id.file_id) {
+        return false;
+    }
+    let Some(existing_sig) = native_symbol_sig_from_frame_id(existing.id) else {
+        return false;
+    };
 
-    same_executable_path(existing.id.file_id, incoming.raw.id.file_id)
-        || existing.id == incoming.raw.id
+    incoming.file.is_some()
+        && incoming.line_no.is_some()
+        && incoming.func.is_some()
+        && incoming.file == existing_sig.file
+        && incoming.line_no == existing_sig.line_no
+        && incoming.func == existing_sig.func
+}
+
+fn shorten_source_path(path: &str, keep_last_parents: usize) -> String {
+    let norm = path.replace('\\', "/");
+    let parts: Vec<&str> = norm.split('/').filter(|x| !x.is_empty()).collect();
+    let keep = keep_last_parents + 1; // parents + filename
+    if parts.len() <= keep {
+        return path.to_owned();
+    }
+
+    format!(".../{}", parts[parts.len() - keep..].join("/"))
+}
+
+fn format_frame_label(sym: &SymbolizedFrame, kind: FrameKind, inline_idx: usize) -> String {
+    let mut out = if let Some(func) = &sym.func {
+        let mut out = func.clone();
+        if let Some(file) = &sym.file {
+            out.push_str(" in ");
+            out.push_str(&shorten_source_path(file, 3));
+        }
+        if let Some(line_no) = sym.line_no {
+            out.push(':');
+            out.push_str(&line_no.to_string());
+        }
+        out
+    } else {
+        // Preserve the richer fallback text (e.g. executable name for native
+        // unsymbolized frames) instead of showing a bare address only.
+        sym.to_string()
+    };
+
+    if let Some(interp) = kind.interp() {
+        if interp != InterpKind::Native {
+            out.push_str(&format!(" [{}]", interp));
+        }
+    }
+    if inline_idx > 0 {
+        out.push_str(" [Inline]");
+    }
+
+    out
 }
 
 impl Default for FlameGraphNode {
@@ -844,13 +898,13 @@ impl FlameGraphNode {
         Self::new_meta_node(format!("{} 100% of all CPU cycles", icons::CPU), 0)
     }
 
-    pub fn new_meta_node(text: String, addr_or_line: u64) -> Self {
+    pub fn new_meta_node(label: String, addr_or_line: u64) -> Self {
         let id = FrameId {
             file_id: FileId::from(0),
             addr_or_line,
         };
         FlameGraphNode {
-            text,
+            label,
             weight: 0,
             id,
             fg_color: Color32::WHITE,
@@ -883,7 +937,7 @@ impl FlameGraphNode {
                     fg_color: Color32::BLACK,
                     bg_color: frame_kind_color(frame.kind),
                     id: frame.id,
-                    text: match error_spec_by_id(frame.id.addr_or_line) {
+                    label: match error_spec_by_id(frame.id.addr_or_line) {
                         Some(spec) => {
                             format!("<unwinding aborted: {}>", spec.name)
                         }
@@ -900,10 +954,6 @@ impl FlameGraphNode {
 
             let inline_frames = symbolize_frame(frame, inline_frames);
             assert!(!inline_frames.is_empty());
-            let first_text = match frame.kind.interp() {
-                None => inline_frames[0].to_string(),
-                Some(interp) => format!("{} [{}]", inline_frames[0], interp),
-            };
 
             // WARN: this `find` makes flame graph construction O(n^2) in the
             //       worst case, but I found that in the average case this is
@@ -914,7 +964,7 @@ impl FlameGraphNode {
             if let Some(mut child) = node
                 .children
                 .iter_mut()
-                .find(|x| node_matches_symbolized_frame(x, &inline_frames[0], &first_text))
+                .find(|x| node_matches_symbolized_frame(x, &inline_frames[0]))
             {
                 child.weight += weight;
 
@@ -931,22 +981,14 @@ impl FlameGraphNode {
 
             for (i, inline_node) in inline_frames.into_iter().enumerate() {
                 assert!(i == 0 || node.children.is_empty());
-                let text = match frame.kind.interp() {
-                    None => inline_node.to_string(),
-                    Some(interp) => format!(
-                        "{} [{}]{}",
-                        inline_node,
-                        interp,
-                        if i > 0 { " [Inline]" } else { "" },
-                    ),
-                };
+                let label = format_frame_label(&inline_node, frame.kind, i);
 
                 node.children.push(FlameGraphNode {
                     weight,
                     fg_color: Color32::BLACK,
                     bg_color: frame_kind_color(frame.kind),
                     id: inline_node.raw.id,
-                    text,
+                    label,
                     inline_skip: inline_len.take().unwrap_or(0),
                     children: vec![],
                 });
@@ -987,11 +1029,11 @@ fn build_sandwich_view(root: &FlameGraphNode, frame_id: FrameId) -> SandwichView
     callers.sort_children();
     callees.sort_children();
 
-    let selected_text = selected_info.unwrap_or_else(|| "Unknown Frame".to_string());
+    let selected_label = selected_info.unwrap_or_else(|| "Unknown Frame".to_string());
 
     SandwichView {
         selected_frame: frame_id,
-        selected_text,
+        selected_label,
         callers,
         callees,
     }
@@ -1011,7 +1053,7 @@ fn collect_paths_through_frame(
         // Found the target frame!
         // Store the frame's display information
         if selected_info.is_none() {
-            *selected_info = Some(node.text.clone());
+            *selected_info = Some(node.label.clone());
         }
 
         // Insert the caller path (inverted) into callers_root
@@ -1028,7 +1070,7 @@ fn collect_paths_through_frame(
     // Skip adding the root frame (100% of all CPU cycles) to the path
     let is_root_frame = node.id.addr_or_line == 0 && node.id.file_id == FileId::from(0);
     if !is_root_frame {
-        path_above.push((node.id, node.bg_color, node.fg_color, node.text.clone()));
+        path_above.push((node.id, node.bg_color, node.fg_color, node.label.clone()));
     }
     for child in &node.children {
         collect_paths_through_frame(
@@ -1056,7 +1098,7 @@ fn insert_caller_path(
     // Walk the path in reverse (from the immediate caller down to the root)
     // so that level 1 is the direct caller and the root is at the top
     let mut current = root;
-    for (frame_id, bg_color, fg_color, text) in path.iter().rev() {
+    for (frame_id, bg_color, fg_color, label) in path.iter().rev() {
         // Find or create child with this frame_id
         if let Some(child) = current.children.iter_mut().find(|x| x.id == *frame_id) {
             child.weight += weight;
@@ -1067,7 +1109,7 @@ fn insert_caller_path(
                 fg_color: *fg_color,
                 bg_color: *bg_color,
                 id: *frame_id,
-                text: text.clone(),
+                label: label.clone(),
                 inline_skip: 0,
                 children: vec![],
             });
@@ -1097,7 +1139,7 @@ fn insert_callee_node(parent: &mut FlameGraphNode, node: &FlameGraphNode) {
             fg_color: node.fg_color,
             bg_color: node.bg_color,
             id: node.id,
-            text: node.text.clone(),
+            label: node.label.clone(),
             inline_skip: node.inline_skip,
             children: vec![],
         });

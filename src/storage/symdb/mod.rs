@@ -252,8 +252,8 @@ pub fn symbolize_frame(frame: Frame, inline_frames: bool) -> SmallVec<[Symbolize
 }
 
 fn symbolize_iterp_frame(raw: Frame) -> SymbolizedFrame {
-    let Some(frame) = DB.stack_frames.get(raw.id.into()) else {
-        return SymbolizedFrame::unsymbolized(raw.into());
+    let Some(frame) = DB.stack_frames.get(raw.id) else {
+        return SymbolizedFrame::unsymbolized(raw);
     };
 
     let frame = frame.get();
