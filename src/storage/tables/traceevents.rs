@@ -16,10 +16,10 @@
 // under the License.
 
 use crate::storage::*;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cmp::max;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::iter::FusedIterator;
 
 #[derive(Debug, PartialEq, Eq, Hash, Default, Copy, Clone)]
@@ -173,8 +173,8 @@ impl TraceEvents {
         kind: SampleKind,
         start: UtcTimestamp,
         end: UtcTimestamp,
-    ) -> HashMap<TraceHash, SampledTrace> {
-        let mut traces = HashMap::<TraceHash, SampledTrace>::new();
+    ) -> FxHashMap<TraceHash, SampledTrace> {
+        let mut traces = FxHashMap::<TraceHash, SampledTrace>::default();
 
         for (_, trace_count) in self.time_range(start, end, kind) {
             let tc = trace_count.get();

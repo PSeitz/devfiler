@@ -27,7 +27,8 @@ use egui::{
     Painter, Pos2, Rangef, Rect, Response, Rounding, Sense, Shape, Vec2,
 };
 use egui_phosphor::regular as icons;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use std::path::Path;
 use std::sync::mpsc;
 
 const FLAME_HEIGHT: f32 = 20.0;
@@ -750,6 +751,46 @@ static ES_B64_ENGINE: base64::engine::GeneralPurpose = base64::engine::GeneralPu
         .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
 );
 
+fn process_name_from_trace(trace: &[ArchivedFrame]) -> Option<String> {
+    for frame in trace {
+        if !matches!(frame.kind.interp(), Some(InterpKind::Native)) {
+            continue;
+        }
+
+        let file_id: FileId = frame.id.file_id.into();
+        let Some(executable) = DB.executables.get(file_id) else {
+            continue;
+        };
+        let executable = executable.get();
+        let Some(path) = executable.executable_path.as_deref() else {
+            continue;
+        };
+
+        let name = Path::new(path)
+            .file_name()
+            .and_then(|x| x.to_str())
+            .filter(|x| !x.is_empty())
+            .unwrap_or(path);
+
+        return Some(name.to_owned());
+    }
+
+    None
+}
+
+fn process_name_for_event(trace: &[ArchivedFrame], comm: &str) -> String {
+    if let Some(process_name) = process_name_from_trace(trace) {
+        return process_name;
+    }
+
+    let comm = comm.trim();
+    if comm.is_empty() {
+        "<unknown process>".to_owned()
+    } else {
+        comm.to_owned()
+    }
+}
+
 /// Pull in events and construct a flame graph data structure for them.
 fn build_flame_graph(
     kind: SampleKind,
@@ -768,31 +809,43 @@ fn build_flame_graph(
     });
 
     // Thread 2 (this one): aggregate.
-    let mut comm_nodes = HashMap::new();
+    let mut process_nodes = FxHashMap::default();
+    let mut process_name_by_trace = FxHashMap::default();
     for tc in event_rx {
         let tc = tc.get();
 
         let Some(trace) = DB.stack_traces.get(tc.trace_hash) else {
             continue;
         };
+        let trace = trace.get();
 
-        let comm_node = if let Some(node) = comm_nodes.get_mut(tc.comm.as_str()) {
+        if !process_name_by_trace.contains_key(&tc.trace_hash) {
+            process_name_by_trace.insert(
+                tc.trace_hash,
+                process_name_for_event(trace, tc.comm.as_str()),
+            );
+        }
+        let process_name = process_name_by_trace
+            .get(&tc.trace_hash)
+            .expect("trace hash should have inferred process name");
+
+        let process_node = if let Some(node) = process_nodes.get_mut(process_name.as_str()) {
             node
         } else {
             // This insert/get chain is dumb, but `try_insert` (which fixes it)
             // is not yet available on stable Rust. `entry` API also isn't any
             // good here because it requires cloning a string in the hot path.
-            comm_nodes.insert(
-                tc.comm.to_owned(),
+            process_nodes.insert(
+                process_name.clone(),
                 FlameGraphNode::new_meta_node(
-                    format!("{} {}", icons::APP_WINDOW, tc.comm),
-                    comm_nodes.len() as u64,
+                    format!("{} {}", icons::APP_WINDOW, process_name),
+                    process_nodes.len() as u64,
                 ),
             );
-            comm_nodes.get_mut(tc.comm.as_str()).unwrap()
+            process_nodes.get_mut(process_name.as_str()).unwrap()
         };
 
-        comm_node.insert_trace(&trace.get(), tc.count as u64, inline_frames);
+        process_node.insert_trace(trace, tc.count as u64, inline_frames);
     }
 
     // Wait for table task to exit.
@@ -800,8 +853,8 @@ fn build_flame_graph(
     rt.block_on(table_task).expect("table task panicked");
 
     let mut root = FlameGraphNode::root();
-    root.weight = comm_nodes.values().map(|x| x.weight).sum();
-    root.children = comm_nodes.into_values().collect();
+    root.weight = process_nodes.values().map(|x| x.weight).sum();
+    root.children = process_nodes.into_values().collect();
     root.sort_children();
     root
 }

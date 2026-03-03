@@ -21,7 +21,7 @@ use crate::ui::cached::Cached;
 use crate::ui::timeaxis;
 use egui::Color32;
 use egui_plot::{Axis, AxisHints, Plot, PlotBounds, Polygon};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Millisecond bucket size for subsecond resolution (e.g., 20ms)
 const MS_BUCKET_SIZE: u64 = 10;
@@ -110,12 +110,12 @@ impl TabWidget for FlameScopeTab {
 #[derive(Debug, Clone, Default)]
 struct HeatMapData {
     /// Map from (second_offset, millisecond_bucket) => sample_count
-    cells: HashMap<(u64, u64), u64>,
+    cells: FxHashMap<(u64, u64), u64>,
     max_count: u64,
 }
 
 fn build_heatmap(kind: SampleKind, start: UtcTimestamp, end: UtcTimestamp) -> HeatMapData {
-    let mut cells = HashMap::new();
+    let mut cells = FxHashMap::default();
     let mut max_count = 0u64;
 
     // Iterate through all trace events in the time range

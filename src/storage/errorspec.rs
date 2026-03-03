@@ -18,7 +18,7 @@
 //! Access to the information from `errors.json`.
 
 use lazy_static::lazy_static;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Information about an UP error.
 #[derive(Debug, serde::Deserialize)]
@@ -43,18 +43,18 @@ static ERROR_JSON: &str = include_str!(concat!(
     "/opentelemetry-ebpf-profiler/tools/errors-codegen/errors.json"
 ));
 
-fn parse_embedded_spec() -> (bool, HashMap<u64, ErrorSpec>) {
+fn parse_embedded_spec() -> (bool, FxHashMap<u64, ErrorSpec>) {
     match serde_json::from_str::<Vec<ErrorSpec>>(&ERROR_JSON) {
         Ok(x) => (true, x.into_iter().map(|x| (x.id, x)).collect()),
         Err(e) => {
             tracing::error!("Failed to parse embedded `errors.json`: {e:?}");
-            return (false, HashMap::new());
+            return (false, FxHashMap::default());
         }
     }
 }
 
 lazy_static! {
-    static ref SPECS: (bool, HashMap<u64, ErrorSpec>) = parse_embedded_spec();
+    static ref SPECS: (bool, FxHashMap<u64, ErrorSpec>) = parse_embedded_spec();
 }
 
 #[cfg(test)]

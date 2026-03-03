@@ -25,9 +25,9 @@ use egui::{Align, Color32, Layout, Sense, Stroke};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icons;
 use nohash_hasher::IntSet;
+use rustc_hash::FxHashMap;
 use std::cmp::min;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::iter;
 use std::iter::FusedIterator;
@@ -390,7 +390,7 @@ fn query_top_funcs(
     // aggregate the counts. The deduplication is required to ensure that
     // we don't account a sample to a location more than once when it occurs
     // more than once within a single trace.
-    let mut aggr = HashMap::<_, Counts>::with_capacity(16 * 1024);
+    let mut aggr = FxHashMap::<_, Counts>::with_capacity_and_hasher(16 * 1024, Default::default());
     let mut seen_this_trace = IntSet::with_capacity_and_hasher(128, Default::default());
 
     for (ts, top_func, new_trace_start, count) in frame_rx {

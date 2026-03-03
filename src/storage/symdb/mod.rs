@@ -18,8 +18,8 @@
 use crate::storage::rkyvtree::ArchivedElement;
 use crate::storage::*;
 use anyhow::{Context, Result};
-use fnv::FnvHashMap;
 use memmap2::Mmap;
+use rustc_hash::FxHashMap;
 use smallvec::{smallvec, SmallVec};
 use std::fmt;
 use std::fs::File;
@@ -31,7 +31,7 @@ use std::sync::RwLock;
 /// Custom data store for symbol information.
 pub struct SymDb {
     dir: PathBuf,
-    cache: RwLock<FnvHashMap<FileId, Option<Arc<MappedSymTree>>>>,
+    cache: RwLock<FxHashMap<FileId, Option<Arc<MappedSymTree>>>>,
 }
 
 impl SymDb {

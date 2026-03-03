@@ -26,7 +26,7 @@ use crate::collector::otlp::pb::profiles::v1development::{
 use crate::collector::Stats;
 use crate::storage::*;
 use chrono::Utc;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::hash::Hash;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -47,7 +47,7 @@ impl ProfilesService {
 
 lazy_static::lazy_static! {
     /// Caches executable path to file ID lookups to avoid repeated file hashing.
-    static ref EXE_PATH_ID_CACHE: Mutex<HashMap<String, FileId>> = Mutex::new(HashMap::new());
+    static ref EXE_PATH_ID_CACHE: Mutex<FxHashMap<String, FileId>> = Mutex::new(FxHashMap::default());
 }
 
 #[tonic::async_trait]
