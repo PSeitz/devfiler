@@ -18,9 +18,9 @@
 use crate::storage::rkyvtree::ArchivedElement;
 use crate::storage::*;
 use anyhow::{Context, Result};
+use fnv::FnvHashMap;
 use memmap2::Mmap;
 use smallvec::{smallvec, SmallVec};
-use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Write};
@@ -31,7 +31,7 @@ use std::sync::RwLock;
 /// Custom data store for symbol information.
 pub struct SymDb {
     dir: PathBuf,
-    cache: RwLock<HashMap<FileId, Option<Arc<MappedSymTree>>>>,
+    cache: RwLock<FnvHashMap<FileId, Option<Arc<MappedSymTree>>>>,
 }
 
 impl SymDb {
@@ -63,7 +63,7 @@ impl SymDb {
         }
 
         // Slow path: open and map file.
-        let mapped = match File::open(&self.path_for_id(file_id, false)) {
+        let mapped = match File::open(self.path_for_id(file_id, false)) {
             Ok(file) => Some(Arc::new(MappedSymTree::open(&file)?)),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(e).context("failed to open symtree"),
@@ -118,7 +118,7 @@ impl SymDb {
         let writer = BufWriter::new(file);
         let ser = WriteSerializer::new(writer);
         let scratch = AllocScratch::default();
-        let shared = Infallible::default();
+        let shared = Default::default();
         let mut serializer = FileSerializer::new(ser, scratch, shared);
 
         serializer
@@ -271,7 +271,7 @@ fn symbolize_iterp_frame(raw: Frame) -> SymbolizedFrame {
 
 fn symbolize_native_frame(raw: Frame, inline_frames: bool) -> SmallVec<[SymbolizedFrame; 2]> {
     // No symbols for executable at all? Fast path.
-    let Some(tree) = DB.symbols.get(raw.id.file_id.into()).unwrap() else {
+    let Some(tree) = DB.symbols.get(raw.id.file_id).unwrap() else {
         return smallvec![SymbolizedFrame::unsymbolized(raw)];
     };
 

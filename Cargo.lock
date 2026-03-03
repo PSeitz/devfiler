@@ -684,6 +684,7 @@ dependencies = [
  "egui_extras",
  "egui_plot",
  "fallible-iterator",
+ "fnv",
  "hashbrown 0.15.2",
  "home",
  "idna 1.0.3",

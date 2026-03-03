@@ -124,8 +124,16 @@ impl TabWidget for FlameGraphTab {
         });
         ui.add_space(5.0);
 
-        self.widget.draw(ui, cfg, &*root);
-        None
+        let clicked_stack = self.widget.draw(ui, cfg, &*root);
+        if clicked_stack {
+            Some(TabAction::SwitchTabWithTimeRange {
+                tab: Tab::FlameGraph,
+                start,
+                end,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -179,7 +187,8 @@ impl Default for FlameGraphWidget {
 }
 
 impl FlameGraphWidget {
-    pub fn draw(&mut self, ui: &mut Ui, cfg: &DevfilerConfig, root: &FlameGraphNode) {
+    pub fn draw(&mut self, ui: &mut Ui, cfg: &DevfilerConfig, root: &FlameGraphNode) -> bool {
+        let mut clicked_stack = false;
         egui::Frame::canvas(ui.style()).show(ui, |ui| {
             let size = ui.available_size_before_wrap();
             let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
@@ -227,6 +236,7 @@ impl FlameGraphWidget {
                     hover_pos,
                     clicked,
                     ctrl_held,
+                    &mut clicked_stack,
                     Pos2::ZERO,
                     size.x * self.x_zoom,
                     root,
@@ -236,6 +246,7 @@ impl FlameGraphWidget {
 
             self.rebuild_matches = false;
         });
+        clicked_stack
     }
 
     /// Draw the sandwich view with callers above and callees below
@@ -374,6 +385,7 @@ impl FlameGraphWidget {
         let callees_y = base_y + FLAME_HEIGHT;
         if !sandwich.callees.children.is_empty() {
             let mut x_offset = 0.0;
+            let mut clicked_stack = false;
             for child in &sandwich.callees.children {
                 let child_width =
                     width * (child.weight as f32 / sandwich.callees.weight.max(1) as f32);
@@ -386,6 +398,7 @@ impl FlameGraphWidget {
                     cursor_hover_pos,
                     false, // No clicking in sandwich view for now
                     false,
+                    &mut clicked_stack,
                     pos2(x_offset, callees_y),
                     child_width,
                     child,
@@ -492,6 +505,7 @@ impl FlameGraphWidget {
         cursor_hover_pos: Option<Pos2>,
         clicked: bool,
         ctrl_held: bool,
+        clicked_stack: &mut bool,
         draw_pos: Pos2,
         avail_width: f32,
         root: &FlameGraphNode,
@@ -582,6 +596,7 @@ impl FlameGraphWidget {
                 );
 
                 if clicked && flame.weight >= 1 {
+                    *clicked_stack = true;
                     if ctrl_held {
                         // Ctrl+Click: Enter sandwich view mode
                         self.sandwich_view = Some(build_sandwich_view(root, flame.id));
@@ -608,6 +623,7 @@ impl FlameGraphWidget {
                 cursor_hover_pos,
                 clicked,
                 ctrl_held,
+                clicked_stack,
                 pos2(offset, draw_pos.y + FLAME_HEIGHT),
                 avail_width,
                 root,
