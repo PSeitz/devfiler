@@ -344,17 +344,21 @@ fn ingest_locations(dic: &ProfilesDictionary) -> Result<Vec<Frame>, Status> {
 
         if matches!(kind.interp(), Some(InterpKind::Native)) {
             if !DB.executables.contains_key(file_id) {
+                let file_name = get_str_opt(
+                    stab,
+                    mapping.filename_strindex as usize,
+                    "file name",
+                )?
+                .map(ToOwned::to_owned);
+                let executable_path = file_name
+                    .as_deref()
+                    .and_then(normalize_executable_path);
                 DB.executables.insert(
                     file_id,
                     ExecutableMeta {
                         build_id: None,
-                        file_name: get_str_opt(
-                            stab,
-                            mapping.filename_strindex as usize,
-                            "file name",
-                        )?
-                        .map(ToOwned::to_owned),
-                        executable_path: None,
+                        file_name,
+                        executable_path,
                         symb_status: SymbStatus::NotAttempted,
                     },
                 );
